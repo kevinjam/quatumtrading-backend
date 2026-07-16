@@ -1,0 +1,55 @@
+name: Deploy API to EC2
+
+# Free-tier friendly: SSH into Ubuntu EC2, pull code, restart systemd.
+# No ECR / ECS / Fargate (those cost money).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: backend-ec2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: SSH deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT }}
+          script_stop: true
+          script: |
+            set -e
+            APP_DIR="/opt/quant-api"
+            cd "$APP_DIR"
+
+            # Production secrets stay on the server — never in git
+            if [ ! -f .env ]; then
+              echo "ERROR: missing $APP_DIR/.env on the EC2 box"
+              echo "Create it once: cp .env.example .env && nano .env"
+              exit 1
+            fi
+
+            git fetch origin main
+            git reset --hard origin/main
+
+            if [ ! -d .venv ]; then
+              python3.11 -m venv .venv || python3 -m venv .venv
+            fi
+            . .venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.txt
+
+            sudo systemctl restart quant-api
+            sleep 3
+            sudo systemctl is-active --quiet quant-api
+            curl -fsS http://127.0.0.1:8000/api/health
+            echo
+            echo "Deploy OK"
