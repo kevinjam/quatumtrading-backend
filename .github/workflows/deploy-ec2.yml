@@ -24,32 +24,61 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_PORT }}
+          # t2.micro cold start + pip can take a while
+          command_timeout: 20m
           script_stop: true
           script: |
             set -e
             APP_DIR="/opt/quant-api"
             cd "$APP_DIR"
 
-            # Production secrets stay on the server — never in git
             if [ ! -f .env ]; then
               echo "ERROR: missing $APP_DIR/.env on the EC2 box"
-              echo "Create it once: cp .env.example .env && nano .env"
               exit 1
             fi
 
+            # Keep secrets readable by the service user after any edits
+            sudo chown "$(whoami):$(whoami)" .env
+            chmod 600 .env
+
             git fetch origin main
             git reset --hard origin/main
+
+            # reset --hard must not wipe secrets
+            if [ ! -f .env ]; then
+              echo "ERROR: .env disappeared after git reset (was it committed then deleted?)"
+              exit 1
+            fi
+            sudo chown "$(whoami):$(whoami)" .env
+            chmod 600 .env
 
             if [ ! -d .venv ]; then
               python3.11 -m venv .venv || python3 -m venv .venv
             fi
             . .venv/bin/activate
-            pip install --upgrade pip
-            pip install -r requirements.txt
+            pip install -q --upgrade pip
+            pip install -q -r requirements.txt
 
             sudo systemctl restart quant-api
-            sleep 3
-            sudo systemctl is-active --quiet quant-api
-            curl -fsS http://127.0.0.1:8000/api/health
-            echo
+
+            echo "Waiting for /api/health ..."
+            ok=0
+            for i in $(seq 1 40); do
+              if curl -fsS http://127.0.0.1:8000/api/health >/tmp/quant-health.json 2>/dev/null; then
+                cat /tmp/quant-health.json
+                echo
+                ok=1
+                break
+              fi
+              # Still booting or crash-looping
+              sleep 3
+            done
+
+            if [ "$ok" != "1" ]; then
+              echo "Health check failed after ~2 minutes"
+              sudo systemctl status quant-api --no-pager -l || true
+              sudo journalctl -u quant-api -n 80 --no-pager || true
+              exit 1
+            fi
+
             echo "Deploy OK"
