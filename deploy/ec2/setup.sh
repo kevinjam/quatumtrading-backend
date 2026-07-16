@@ -35,6 +35,10 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
+# Service runs as ubuntu — .env must be readable by that user
+sudo chown "$USER:$USER" "$APP_DIR/.env"
+chmod 600 "$APP_DIR/.env"
+
 echo "==> Python venv + deps"
 python3.11 -m venv .venv 2>/dev/null || python3 -m venv .venv
 # shellcheck disable=SC1091
@@ -53,8 +57,21 @@ sudo systemctl enable quant-api
 sudo systemctl restart quant-api
 
 echo "==> Health"
-sleep 2
-curl -fsS http://127.0.0.1:8000/api/health || true
-echo
+sleep 5
+if curl -fsS http://127.0.0.1:8000/api/health; then
+  echo
+  echo "API is up."
+else
+  echo
+  echo "API did not respond on :8000 — showing service logs:"
+  sudo systemctl status quant-api --no-pager -l || true
+  echo "----- last 80 log lines -----"
+  sudo journalctl -u quant-api -n 80 --no-pager || true
+  echo
+  echo "Quick manual test (shows the real Python error):"
+  echo "  cd $APP_DIR && set -a && source .env && set +a && .venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000"
+  exit 1
+fi
+
 echo "Done. Open security group port 8000 (or put nginx on 80/443 later)."
 echo "Production env file lives ONLY on the server: $APP_DIR/.env"
