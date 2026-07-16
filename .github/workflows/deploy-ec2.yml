@@ -1,7 +1,6 @@
 name: Deploy API to EC2
 
-# Free-tier friendly: SSH into Ubuntu EC2, pull code, restart systemd.
-# No ECR / ECS / Fargate (those cost money).
+# Free-tier: SSH → git pull → restart systemd → health check
 
 on:
   push:
@@ -16,6 +15,7 @@ jobs:
   deploy:
     name: SSH deploy
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.0
@@ -24,7 +24,6 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_PORT }}
-          # t2.micro cold start + pip can take a while
           command_timeout: 20m
           script_stop: true
           script: |
@@ -33,20 +32,18 @@ jobs:
             cd "$APP_DIR"
 
             if [ ! -f .env ]; then
-              echo "ERROR: missing $APP_DIR/.env on the EC2 box"
+              echo "ERROR: missing $APP_DIR/.env"
               exit 1
             fi
 
-            # Keep secrets readable by the service user after any edits
             sudo chown "$(whoami):$(whoami)" .env
             chmod 600 .env
 
             git fetch origin main
             git reset --hard origin/main
 
-            # reset --hard must not wipe secrets
             if [ ! -f .env ]; then
-              echo "ERROR: .env disappeared after git reset (was it committed then deleted?)"
+              echo "ERROR: .env missing after git reset"
               exit 1
             fi
             sudo chown "$(whoami):$(whoami)" .env
@@ -59,25 +56,38 @@ jobs:
             pip install -q --upgrade pip
             pip install -q -r requirements.txt
 
-            sudo systemctl restart quant-api
+            # Don't hang if the unit is crash-looping
+            sudo systemctl reset-failed quant-api || true
+            sudo systemctl restart quant-api || true
 
-            echo "Waiting for /api/health ..."
+            echo "Waiting for /api/health (max ~90s)..."
             ok=0
-            for i in $(seq 1 40); do
-              if curl -fsS http://127.0.0.1:8000/api/health >/tmp/quant-health.json 2>/dev/null; then
+            for i in $(seq 1 30); do
+              if curl -fsS --connect-timeout 2 --max-time 3 \
+                  http://127.0.0.1:8000/api/health \
+                  >/tmp/quant-health.json 2>/dev/null; then
+                echo "Health OK:"
                 cat /tmp/quant-health.json
                 echo
                 ok=1
                 break
               fi
-              # Still booting or crash-looping
+              state="$(systemctl is-active quant-api 2>/dev/null || true)"
+              echo "  try $i/30 — service=$state"
+              if [ "$i" = "10" ] || [ "$i" = "20" ]; then
+                echo "----- recent logs -----"
+                sudo journalctl -u quant-api -n 30 --no-pager || true
+              fi
               sleep 3
             done
 
             if [ "$ok" != "1" ]; then
-              echo "Health check failed after ~2 minutes"
+              echo "DEPLOY FAILED — API never became healthy"
               sudo systemctl status quant-api --no-pager -l || true
-              sudo journalctl -u quant-api -n 80 --no-pager || true
+              sudo journalctl -u quant-api -n 100 --no-pager || true
+              echo
+              echo "Manual check on EC2:"
+              echo "  cd /opt/quant-api && set -a && source .env && set +a && .venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000"
               exit 1
             fi
 

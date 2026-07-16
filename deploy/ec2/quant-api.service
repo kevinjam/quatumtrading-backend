@@ -11,7 +11,8 @@ EnvironmentFile=/opt/quant-api/.env
 ExecStart=/opt/quant-api/.venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*
 Restart=always
 RestartSec=5
-# Give the free-tier box room to import pandas/numpy on boot
+TimeoutStartSec=30
+TimeoutStopSec=15
 MemoryMax=900M
 
 [Install]
